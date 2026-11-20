@@ -20,7 +20,7 @@ set -euo pipefail
 INSTANCE_NAME="${INSTANCE_NAME:-fabricate}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.large}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
-ADMIN_EMAIL="${ADMIN_EMAIL:-admin@fabricate.local}"
+ADMIN_EMAIL="${ADMIN_EMAIL:-}"
 SG_NAME="${SG_NAME:-${INSTANCE_NAME}-sg}"
 KEY_NAME="${KEY_NAME:-${INSTANCE_NAME}-key}"
 DISK_SIZE_GB="${DISK_SIZE_GB:-60}"
@@ -45,6 +45,11 @@ source "${SCRIPT_DIR}/.env"
 : "${FABRICATE_LICENSE:?FABRICATE_LICENSE not set in .env}"
 : "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY not set in .env}"
 : "${TAGS:?TAGS not set in .env (format: Key:Value,Key:Value)}"
+if [[ "$AUTO_SETUP_ADMIN" == "true" ]]; then
+  : "${ADMIN_EMAIL:?ADMIN_EMAIL must be set in .env when AUTO_SETUP_ADMIN=true}"
+else
+  ADMIN_EMAIL="${ADMIN_EMAIL:-admin@fabricate.local}"
+fi
 
 # Parse TAGS="Key:Value,Key:Value" into the two formats AWS CLI expects.
 # AWS_TAGS_KV  — space-separated "Key=k,Value=v" args for aws ec2 create-tags
