@@ -1,0 +1,100 @@
+# stand-up-fabricate
+
+Spins up a self-hosted [Fabricate](https://docs.tonic.ai/fabricate) instance on AWS EC2 using Docker Compose.
+
+## Prerequisites
+
+- AWS CLI configured with credentials
+- `python3` in your PATH (used for VPC selection)
+- `openssl` in your PATH (used to generate random passwords)
+- A `.env` file in this directory (see below)
+
+## .env file
+
+Copy the template and fill in your values:
+
+```bash
+cp .env.template .env
+```
+
+**Required** (provided by Tonic.ai):
+
+| Variable | Description |
+|---|---|
+| `QUAY_IO_USER` | Quay.io username for pulling Fabricate images |
+| `QUAY_IO_PASSWORD` | Quay.io password |
+| `FABRICATE_LICENSE` | Fabricate license key (`FAB1.eyJ...`) |
+| `ANTHROPIC_API_KEY` | Anthropic API key — required to use Fabricate's AI features |
+
+**Optional** (uncomment in `.env` to override):
+
+| Variable | Default | Description |
+|---|---|---|
+| `INSTANCE_NAME` | `fabricate` | Name tag applied to all resources; also used for the key pair and state file names |
+| `INSTANCE_TYPE` | `t3.large` | EC2 instance type (8 GB RAM recommended minimum) |
+| `AWS_REGION` | `us-east-1` | AWS region to deploy into |
+| `ADMIN_EMAIL` | `admin@fabricate.local` | Email for the initial Fabricate admin account |
+| `DISK_SIZE_GB` | `40` | Root EBS volume size in GB |
+| `VPC_ID` | _(prompts)_ | Pre-set to skip the interactive VPC selection |
+
+## Usage
+
+```bash
+# Basic — prompts for VPC selection
+./stand-up-fabricate.sh
+
+# Override defaults inline (or set them in .env)
+INSTANCE_NAME=my-fab \
+INSTANCE_TYPE=t3.xlarge \
+AWS_REGION=us-west-2 \
+  ./stand-up-fabricate.sh
+
+# Tear down all resources
+./tear-down-fabricate.sh
+# or, if you used a custom instance name:
+./tear-down-fabricate.sh my-fab
+```
+
+## What it does
+
+1. Presents an interactive VPC selection menu
+2. Finds a public subnet (one with an internet gateway route)
+3. Creates a security group opening ports 22, 80, 443, and 3000
+4. Creates an SSH key pair saved as `<INSTANCE_NAME>-key.pem`
+5. Finds the latest Ubuntu 24.04 LTS AMI and launches the EC2 instance
+6. Installs Docker via EC2 user-data on first boot
+7. Logs in to `quay.io`, pulls the Fabricate images, generates a `SECRET_KEY_BASE`
+8. Writes the Fabricate `.env` and `docker-compose.yaml` to `~/fabricate/` on the instance
+9. Starts all services with `docker compose up -d`
+
+All AWS resources are tagged with `tonic.ai/owner=ken@tonic.ai` and `tonic.ai/product=sa`.
+
+## Completing setup
+
+After the script finishes it prints the URL, e.g. `http://<public-ip>:3000`. Open it and follow the setup wizard:
+
+1. Click **Get Started**
+2. Run the compatibility check
+3. Enter your license key
+4. Configure telemetry
+5. Create your admin account (use the `ADMIN_EMAIL` you configured)
+
+### Switching LLM providers after deployment
+
+Other LLM providers (Amazon Bedrock, Azure AI Foundry, OpenAI, Google Vertex AI) can be configured by SSH-ing in and editing `~/fabricate/.env` on the instance, then restarting:
+
+```bash
+ssh -i fabricate-key.pem -o IdentitiesOnly=yes ubuntu@<public-ip>
+nano ~/fabricate/.env
+sudo docker compose -f ~/fabricate/docker-compose.yaml up -d --force-recreate
+```
+
+See the [template.env](https://github.com/TonicAI/fabricate_docker_compose/blob/main/.template.env) for the full list of supported provider variables.
+
+## Tear down
+
+```bash
+./tear-down-fabricate.sh
+```
+
+This terminates the EC2 instance, deletes the security group, deletes the key pair, and removes the local `.pem` file. It reads resource IDs from the state file (`.fabricate-state-<INSTANCE_NAME>.env`) written by the stand-up script.
