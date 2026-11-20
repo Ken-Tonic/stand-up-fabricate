@@ -1,6 +1,6 @@
 # stand-up-fabricate
 
-Spins up a self-hosted [Fabricate](https://docs.tonic.ai/fabricate) instance on AWS EC2 using Docker Compose.
+Spins up a self-hosted [Fabricate](https://docs.tonic.ai/fabricate) instance on AWS EC2 using Docker Compose, with nginx providing HTTPS termination via a self-signed certificate.
 
 ## Prerequisites
 
@@ -25,6 +25,7 @@ cp .env.template .env
 | `QUAY_IO_PASSWORD` | Quay.io password |
 | `FABRICATE_LICENSE` | Fabricate license key (`FAB1.eyJ...`) |
 | `ANTHROPIC_API_KEY` | Anthropic API key — required to use Fabricate's AI features |
+| `TAGS` | Tags applied to all AWS resources. Format: `Key:Value,Key:Value,...` |
 
 **Optional** (uncomment in `.env` to override):
 
@@ -36,6 +37,7 @@ cp .env.template .env
 | `ADMIN_EMAIL` | `admin@fabricate.local` | Email for the initial Fabricate admin account |
 | `DISK_SIZE_GB` | `60` | Root EBS volume size in GB |
 | `VPC_ID` | _(prompts)_ | Pre-set to skip the interactive VPC selection |
+| `AUTO_SETUP_ADMIN` | `false` | When `true`, creates the admin account automatically and prints the generated password at the end — no setup wizard step required |
 
 ## Usage
 
@@ -59,25 +61,32 @@ AWS_REGION=us-west-2 \
 
 1. Presents an interactive VPC selection menu
 2. Finds a public subnet (one with an internet gateway route)
-3. Creates a security group opening ports 22, 80, 443, and 3000
+3. Creates a security group opening ports 22, 80, and 443 (plus 8025 when using Mailhog)
 4. Creates an SSH key pair saved as `<INSTANCE_NAME>-key.pem`
 5. Finds the latest Ubuntu 24.04 LTS AMI and launches the EC2 instance
 6. Installs Docker via EC2 user-data on first boot
 7. Logs in to `quay.io`, pulls the Fabricate images, generates a `SECRET_KEY_BASE`
-8. Writes the Fabricate `.env` and `docker-compose.yaml` to `~/fabricate/` on the instance
-9. Starts all services with `docker compose up -d`
+8. Generates a self-signed TLS certificate on the instance
+9. Uploads `docker-compose.yaml`, `nginx.conf`, `.env` (and `docker-compose.mailhog.yaml` when using Mailhog) to `~/fabricate/` on the instance
+10. Starts all services with `docker compose up -d`
+11. Pre-installs the license key via Rails runner so the setup wizard skips that step
+12. _(If `AUTO_SETUP_ADMIN=true`)_ Creates the admin account via Rails runner with a randomly generated password, bypassing Devise email confirmation
 
-All AWS resources are tagged with `tonic.ai/owner=ken@tonic.ai` and `tonic.ai/product=sa`.
+All AWS resources are tagged with the key-value pairs defined in `TAGS` in `.env`.
 
 ## Completing setup
 
-After the script finishes it prints the URL, e.g. `http://<public-ip>:3000`. Open it and follow the setup wizard:
+After the script finishes it prints the URL, e.g. `https://<public-ip>`. Open it in your browser:
+
+- Your browser will warn about the self-signed certificate — click **Advanced → Proceed** to continue.
+
+Then follow the setup wizard:
 
 1. Click **Get Started**
 2. Run the compatibility check
-3. Enter your license key
+3. _(License is pre-installed — this step should be pre-filled)_
 4. Configure telemetry
-5. Create your admin account (use the `ADMIN_EMAIL` you configured)
+5. Create your admin account (use the `ADMIN_EMAIL` you configured) — _skipped if `AUTO_SETUP_ADMIN=true`; credentials are printed at the end of the script_
 
 ### Email delivery
 
@@ -98,10 +107,27 @@ Other LLM providers (Amazon Bedrock, Azure AI Foundry, OpenAI, Google Vertex AI)
 ```bash
 ssh -i fabricate-key.pem -o IdentitiesOnly=yes ubuntu@<public-ip>
 nano ~/fabricate/.env
-sudo docker compose -f ~/fabricate/docker-compose.yaml up -d --force-recreate
+# If using Mailhog email mode:
+sudo docker compose -f docker-compose.yaml -f docker-compose.mailhog.yaml up -d --force-recreate
+# Otherwise:
+sudo docker compose up -d --force-recreate
 ```
 
 See the [template.env](https://github.com/TonicAI/fabricate_docker_compose/blob/main/.template.env) for the full list of supported provider variables.
+
+## Repository structure
+
+```
+.
+├── stand-up-fabricate.sh           # provisions and configures the EC2 instance
+├── tear-down-fabricate.sh          # tears down all AWS resources
+├── .env                            # your credentials (not committed)
+├── .env.template                   # copy this to .env and fill in values
+└── templates/
+    ├── docker-compose.yaml         # core services: db, redis, pdf-sidecar, web, worker, nginx
+    ├── docker-compose.mailhog.yaml # merged in when EMAIL_MODE=mailhog
+    └── nginx.conf                  # nginx reverse proxy: HTTP→HTTPS redirect, SSL termination, WebSocket support
+```
 
 ## Tear down
 

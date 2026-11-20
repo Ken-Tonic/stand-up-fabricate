@@ -24,6 +24,8 @@ ADMIN_EMAIL="${ADMIN_EMAIL:-admin@fabricate.local}"
 SG_NAME="${SG_NAME:-${INSTANCE_NAME}-sg}"
 KEY_NAME="${KEY_NAME:-${INSTANCE_NAME}-key}"
 DISK_SIZE_GB="${DISK_SIZE_GB:-60}"
+AUTO_SETUP_ADMIN="${AUTO_SETUP_ADMIN:-false}"
+TAGS="${TAGS:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SSH_KEY_FILE="${SCRIPT_DIR}/${KEY_NAME}.pem"
@@ -42,6 +44,23 @@ source "${SCRIPT_DIR}/.env"
 : "${QUAY_IO_PASSWORD:?QUAY_IO_PASSWORD not set in .env}"
 : "${FABRICATE_LICENSE:?FABRICATE_LICENSE not set in .env}"
 : "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY not set in .env}"
+: "${TAGS:?TAGS not set in .env (format: Key:Value,Key:Value)}"
+
+# Parse TAGS="Key:Value,Key:Value" into the two formats AWS CLI expects.
+# AWS_TAGS_KV  — space-separated "Key=k,Value=v" args for aws ec2 create-tags
+# AWS_TAGS_JSON — comma-separated "{Key=k,Value=v}" fragment for --tag-specifications
+AWS_TAGS_KV=""
+AWS_TAGS_JSON=""
+IFS=',' read -ra _TAG_PAIRS <<< "$TAGS"
+for _pair in "${_TAG_PAIRS[@]}"; do
+  _key="${_pair%%:*}"
+  _val="${_pair#*:}"
+  AWS_TAGS_KV+="Key=${_key},Value=${_val} "
+  AWS_TAGS_JSON+="{Key=${_key},Value=${_val}},"
+done
+AWS_TAGS_KV="${AWS_TAGS_KV% }"
+AWS_TAGS_JSON="${AWS_TAGS_JSON%,}"
+unset _TAG_PAIRS _pair _key _val
 
 # ---------------------------------------------------------------------------
 # Generate random credentials for Postgres and Redis
@@ -152,13 +171,10 @@ else
   aws ec2 create-tags \
     --region "$AWS_REGION" \
     --resources "$SG_ID" \
-    --tags \
-      "Key=Name,Value=${SG_NAME}" \
-      "Key=tonic.ai/owner,Value=ken@tonic.ai" \
-      "Key=tonic.ai/product,Value=sa"
+    --tags "Key=Name,Value=${SG_NAME}" ${AWS_TAGS_KV}
 
-  # SSH, HTTP, HTTPS, Fabricate app
-  for PORT in 22 80 443 3000; do
+  # SSH, HTTP, HTTPS (nginx handles all Fabricate traffic on 80/443)
+  for PORT in 22 80 443; do
     echo "    Authorizing inbound port $PORT from 0.0.0.0/0..."
     aws ec2 authorize-security-group-ingress \
       --region "$AWS_REGION" \
@@ -183,7 +199,7 @@ else
   aws ec2 create-key-pair \
     --region "$AWS_REGION" \
     --key-name "$KEY_NAME" \
-    --tag-specifications "ResourceType=key-pair,Tags=[{Key=Name,Value=${KEY_NAME}},{Key=tonic.ai/owner,Value=ken@tonic.ai},{Key=tonic.ai/product,Value=sa}]" \
+    --tag-specifications "ResourceType=key-pair,Tags=[{Key=Name,Value=${KEY_NAME}},${AWS_TAGS_JSON}]" \
     --query "KeyMaterial" \
     --output text > "$SSH_KEY_FILE"
   chmod 600 "$SSH_KEY_FILE"
@@ -284,8 +300,8 @@ INSTANCE_ID=$(aws ec2 run-instances \
   --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":${DISK_SIZE_GB},\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
   --user-data "file://${USER_DATA_FILE}" \
   --tag-specifications \
-    "ResourceType=instance,Tags=[{Key=Name,Value=${INSTANCE_NAME}},{Key=tonic.ai/owner,Value=ken@tonic.ai},{Key=tonic.ai/product,Value=sa}]" \
-    "ResourceType=volume,Tags=[{Key=Name,Value=${INSTANCE_NAME}},{Key=tonic.ai/owner,Value=ken@tonic.ai},{Key=tonic.ai/product,Value=sa}]" \
+    "ResourceType=instance,Tags=[{Key=Name,Value=${INSTANCE_NAME}},${AWS_TAGS_JSON}]" \
+    "ResourceType=volume,Tags=[{Key=Name,Value=${INSTANCE_NAME}},${AWS_TAGS_JSON}]" \
   --query "Instances[0].InstanceId" \
   --output text)
 echo "    Instance ID: $INSTANCE_ID"
@@ -570,6 +586,24 @@ ssh -i "$SSH_KEY_FILE" \
   || echo "    WARNING: License pre-install failed — you will need to enter it in the setup wizard." >&2
 
 # ---------------------------------------------------------------------------
+# Auto-create admin user (if AUTO_SETUP_ADMIN=true)
+# ---------------------------------------------------------------------------
+ADMIN_PASSWORD=""
+if [[ "$AUTO_SETUP_ADMIN" == "true" ]]; then
+  echo "==> Creating admin user (${ADMIN_EMAIL})..."
+  ADMIN_PASSWORD=$(openssl rand -base64 20 | tr -d '/+=' | cut -c1-15)
+  ADMIN_RUBY="User.create!(email: '${ADMIN_EMAIL}', password: '${ADMIN_PASSWORD}', password_confirmation: '${ADMIN_PASSWORD}', confirmed_at: Time.now, name: 'Admin')"
+  ssh -i "$SSH_KEY_FILE" \
+    -o StrictHostKeyChecking=no \
+    -o IdentitiesOnly=yes \
+    -o BatchMode=yes \
+    "ubuntu@${PUBLIC_IP}" \
+    "cd ~/fabricate && ${REMOTE_COMPOSE_CMD} exec -T web bin/rails runner \"${ADMIN_RUBY}\"" \
+    && echo "    Admin user created." \
+    || echo "    WARNING: Admin user creation failed — create it manually via the setup wizard." >&2
+fi
+
+# ---------------------------------------------------------------------------
 # Save state for tear-down
 # ---------------------------------------------------------------------------
 cat > "$STATE_FILE" <<EOF
@@ -594,6 +628,9 @@ echo "  Instance ID:  $INSTANCE_ID"
 echo "  Public IP:    $PUBLIC_IP"
 echo "  Fabricate:    https://${PUBLIC_IP}  (self-signed cert — click through browser warning)"
 echo "  Admin email:  $ADMIN_EMAIL"
+if [[ -n "$ADMIN_PASSWORD" ]]; then
+echo "  Admin pass:   $ADMIN_PASSWORD"
+fi
 if [[ "$EMAIL_MODE" == "mailhog" ]]; then
 echo "  Mailhog UI:   http://${PUBLIC_IP}:8025  (captured outbound email)"
 elif [[ "$EMAIL_MODE" == "smtp" ]]; then
@@ -615,7 +652,11 @@ echo "Complete setup at: https://${PUBLIC_IP}"
 echo "  (Your browser will warn about a self-signed certificate — click 'Advanced' and proceed.)"
 echo "  1. Click 'Get Started'"
 echo "  2. Run the compatibility check"
-echo "  3. Enter your license key"
+echo "  3. License is pre-installed"
 echo "  4. Configure telemetry"
+if [[ -n "$ADMIN_PASSWORD" ]]; then
+echo "  5. Admin account is pre-created — log in with the credentials above"
+else
 echo "  5. Create your admin account (use ${ADMIN_EMAIL})"
+fi
 echo ""
