@@ -1,6 +1,8 @@
 # stand-up-fabricate
 
-Spins up a self-hosted [Fabricate](https://docs.tonic.ai/fabricate) instance on AWS EC2 using Docker Compose, with nginx providing HTTPS termination via a self-signed certificate.
+This repo automates the installation of self hosted [Tonic Fabricate](https://docs.tonic.ai/fabricate) on AWS, the objective being to provide a very quick and easy way of doing the install.
+
+In doing so it makes a number of choices re configuration i) use of AWS ii) use of Anthropic iii) use of nginx for http / https marshalling. More general options are availabe if this approach does not suit - see [Fabricate docs](https://docs.tonic.ai/fabricate/self-hosting-fabricate/deploying-and-managing-a-self-hosted-instance/using-docker-compose/completing-a-docker-compose-deployment)
 
 ## Prerequisites
 

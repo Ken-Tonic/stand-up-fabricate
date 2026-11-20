@@ -597,7 +597,7 @@ ADMIN_PASSWORD=""
 if [[ "$AUTO_SETUP_ADMIN" == "true" ]]; then
   echo "==> Creating admin user (${ADMIN_EMAIL})..."
   ADMIN_PASSWORD=$(openssl rand -base64 20 | tr -d '/+=' | cut -c1-15)
-  ADMIN_RUBY="User.create!(email: '${ADMIN_EMAIL}', password: '${ADMIN_PASSWORD}', password_confirmation: '${ADMIN_PASSWORD}', confirmed_at: Time.now, name: 'Admin')"
+  ADMIN_RUBY="u = User.create!(email: '${ADMIN_EMAIL}', password: '${ADMIN_PASSWORD}', password_confirmation: '${ADMIN_PASSWORD}', confirmed_at: Time.now, name: 'Admin'); account = Account.create!(name: 'Fabricate', plan: Plan.first); Membership.create!(user: u, account: account, role: 'owner'); puts 'ok'"
   ssh -i "$SSH_KEY_FILE" \
     -o StrictHostKeyChecking=no \
     -o IdentitiesOnly=yes \
