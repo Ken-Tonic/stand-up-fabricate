@@ -23,7 +23,7 @@ AWS_REGION="${AWS_REGION:-us-east-1}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@fabricate.local}"
 SG_NAME="${SG_NAME:-${INSTANCE_NAME}-sg}"
 KEY_NAME="${KEY_NAME:-${INSTANCE_NAME}-key}"
-DISK_SIZE_GB="${DISK_SIZE_GB:-40}"
+DISK_SIZE_GB="${DISK_SIZE_GB:-60}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SSH_KEY_FILE="${SCRIPT_DIR}/${KEY_NAME}.pem"
@@ -431,6 +431,35 @@ FABRICATE_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
 FABRICATE_LICENSE_KEY=${FABRICATE_LICENSE}
 EOF
 
+# --- Email delivery ---
+# Priority: custom SMTP > SES (opt-in) > Mailhog (default)
+if [[ -n "${FABRICATE_MAIL_ADDRESS:-}" ]]; then
+  # Custom SMTP — user set FABRICATE_MAIL_ADDRESS in their .env
+  cat >> "${TMP_DIR}/.env" <<EOF
+
+FABRICATE_MAIL_ADDRESS=${FABRICATE_MAIL_ADDRESS}
+FABRICATE_MAIL_PORT=${FABRICATE_MAIL_PORT}
+FABRICATE_MAIL_USER_NAME=${FABRICATE_MAIL_USER_NAME}
+FABRICATE_MAIL_PASSWORD=${FABRICATE_MAIL_PASSWORD}
+EOF
+  EMAIL_MODE=smtp
+elif [[ "${FABRICATE_USE_SES:-false}" == "true" ]]; then
+  # SES via EC2 IAM role — no FABRICATE_MAIL_* vars needed
+  EMAIL_MODE=ses
+else
+  # Default: Mailhog local sink (accepts all, never delivers)
+  # production.rb requires MAIL_USER_NAME + MAIL_PASSWORD when MAIL_ADDRESS is set;
+  # Mailhog ignores credentials entirely.
+  cat >> "${TMP_DIR}/.env" <<EOF
+
+FABRICATE_MAIL_ADDRESS=mailhog
+FABRICATE_MAIL_PORT=1025
+FABRICATE_MAIL_USER_NAME=mailhog
+FABRICATE_MAIL_PASSWORD=mailhog
+EOF
+  EMAIL_MODE=mailhog
+fi
+
 if [[ -n "$ANTHROPIC_API_KEY" ]]; then
   cat >> "${TMP_DIR}/.env" <<EOF
 
@@ -439,117 +468,20 @@ FABRICATE_ANTHROPIC_BASE_URL=https://api.anthropic.com
 EOF
 fi
 
-# --- docker-compose.yaml (single-quoted heredoc — no shell expansion) ---
-cat > "${TMP_DIR}/docker-compose.yaml" <<'COMPOSEEOF'
-networks:
-  fabricate_internal:
-    driver: bridge
-  fabricate_internal_pdf:
-    internal: true
+# --- docker-compose and nginx config from templates ---
+cp "${SCRIPT_DIR}/templates/docker-compose.yaml" "${TMP_DIR}/docker-compose.yaml"
+cp "${SCRIPT_DIR}/templates/nginx.conf"           "${TMP_DIR}/nginx.conf"
 
-volumes:
-  fabricate_data:
-  fabricate_local_storage:
-  postgres_data:
+# Mailhog is a separate compose override file; Docker Compose merges it at runtime.
+if [[ "$EMAIL_MODE" == "mailhog" ]]; then
+  cp "${SCRIPT_DIR}/templates/docker-compose.mailhog.yaml" "${TMP_DIR}/docker-compose.mailhog.yaml"
+fi
 
-services:
-  db:
-    image: postgres:16
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${FABRICATE_DATABASE_USERNAME}
-      POSTGRES_PASSWORD: ${FABRICATE_DATABASE_PASSWORD}
-      POSTGRES_DB: ${FABRICATE_DATABASE_NAME}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    networks:
-      - fabricate_internal
-
-  redis:
-    image: 'redis:7.4.8'
-    restart: unless-stopped
-    environment:
-      REDIS_PASSWORD: ${FABRICATE_REDIS_PASSWORD}
-    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\""]
-    networks:
-      - fabricate_internal
-
-  pdf-sidecar:
-    image: 'quay.io/tonicai/fabricate-html-to-pdf-sidecar:latest'
-    restart: unless-stopped
-    cap_drop:
-      - ALL
-    read_only: true
-    security_opt:
-      - no-new-privileges:true
-    mem_limit: 1024m
-    environment:
-      FABRICATE_PDF_PORT: ${FABRICATE_PDF_PORT:-3100}
-    volumes:
-      - type: tmpfs
-        target: /tmp
-        tmpfs:
-          size: 536870912
-      - type: tmpfs
-        target: /dev/shm
-        tmpfs:
-          size: 268435456
-    networks:
-      - fabricate_internal_pdf
-
-  web:
-    image: 'quay.io/tonicai/fabricate:latest'
-    restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_started
-      redis:
-        condition: service_started
-      pdf-sidecar:
-        condition: service_healthy
-    ports:
-      - '3000:3000'
-    env_file:
-      - .env
-    environment:
-      FABRICATE_PDF_HOST: pdf-sidecar
-      FABRICATE_PDF_PORT: ${FABRICATE_PDF_PORT:-3100}
-    cap_add:
-      - SYS_PTRACE
-    volumes:
-      - fabricate_data:/fabricate/data
-      - fabricate_local_storage:/fabricate/storage
-    networks:
-      - fabricate_internal
-      - fabricate_internal_pdf
-
-  worker:
-    image: 'quay.io/tonicai/fabricate:latest'
-    restart: unless-stopped
-    command: ["bundle", "exec", "sidekiq", "-e", "production"]
-    depends_on:
-      db:
-        condition: service_started
-      redis:
-        condition: service_started
-      pdf-sidecar:
-        condition: service_healthy
-      web:
-        condition: service_started
-    env_file:
-      - .env
-    environment:
-      FABRICATE_PDF_HOST: pdf-sidecar
-      FABRICATE_PDF_PORT: ${FABRICATE_PDF_PORT:-3100}
-    cap_add:
-      - SYS_PTRACE
-    volumes:
-      - fabricate_data:/fabricate/data
-      - fabricate_local_storage:/fabricate/storage
-    networks:
-      - fabricate_internal
-      - fabricate_internal_pdf
-COMPOSEEOF
+# Build the docker compose command used on the instance (base + optional mailhog override)
+REMOTE_COMPOSE_CMD="sudo docker compose"
+if [[ "$EMAIL_MODE" == "mailhog" ]]; then
+  REMOTE_COMPOSE_CMD="sudo docker compose -f docker-compose.yaml -f docker-compose.mailhog.yaml"
+fi
 
 # ---------------------------------------------------------------------------
 # Upload config to instance
@@ -559,14 +491,29 @@ ssh -i "$SSH_KEY_FILE" \
   -o StrictHostKeyChecking=no \
   -o IdentitiesOnly=yes \
   -o BatchMode=yes \
-  "ubuntu@${PUBLIC_IP}" "mkdir -p ~/fabricate"
+  "ubuntu@${PUBLIC_IP}" "mkdir -p ~/fabricate/certs"
+
+SCP_FILES=("${TMP_DIR}/.env" "${TMP_DIR}/docker-compose.yaml" "${TMP_DIR}/nginx.conf")
+[[ "$EMAIL_MODE" == "mailhog" ]] && SCP_FILES+=("${TMP_DIR}/docker-compose.mailhog.yaml")
 
 scp -i "$SSH_KEY_FILE" \
   -o StrictHostKeyChecking=no \
   -o IdentitiesOnly=yes \
-  "${TMP_DIR}/.env" \
-  "${TMP_DIR}/docker-compose.yaml" \
+  "${SCP_FILES[@]}" \
   "ubuntu@${PUBLIC_IP}:~/fabricate/"
+
+# Generate self-signed TLS certificate on the instance
+echo "==> Generating self-signed TLS certificate..."
+ssh -i "$SSH_KEY_FILE" \
+  -o StrictHostKeyChecking=no \
+  -o IdentitiesOnly=yes \
+  -o BatchMode=yes \
+  "ubuntu@${PUBLIC_IP}" \
+  "openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    -keyout ~/fabricate/certs/fabricate.key \
+    -out ~/fabricate/certs/fabricate.crt \
+    -subj '/CN=${PUBLIC_IP}' 2>/dev/null"
+echo "    Certificate generated (self-signed, valid 365 days)."
 
 # ---------------------------------------------------------------------------
 # Start Fabricate
@@ -577,8 +524,50 @@ ssh -i "$SSH_KEY_FILE" \
   -o IdentitiesOnly=yes \
   -o BatchMode=yes \
   "ubuntu@${PUBLIC_IP}" \
-  "cd ~/fabricate && sudo docker compose up -d"
+  "cd ~/fabricate && ${REMOTE_COMPOSE_CMD} up -d"
 echo "    Services started."
+
+if [[ "$EMAIL_MODE" == "mailhog" ]]; then
+  echo "==> Opening port 8025 for Mailhog web UI..."
+  aws ec2 authorize-security-group-ingress \
+    --region "$AWS_REGION" \
+    --group-id "$SG_ID" \
+    --protocol tcp \
+    --port 8025 \
+    --cidr "0.0.0.0/0" > /dev/null
+fi
+
+# ---------------------------------------------------------------------------
+# Wait for the web app to be ready, then pre-install the license
+# ---------------------------------------------------------------------------
+echo "==> Waiting for Fabricate web app to be ready..."
+for i in $(seq 1 60); do
+  STATUS=$(ssh -i "$SSH_KEY_FILE" \
+    -o StrictHostKeyChecking=no \
+    -o IdentitiesOnly=yes \
+    -o ConnectTimeout=10 \
+    -o BatchMode=yes \
+    "ubuntu@${PUBLIC_IP}" \
+    "curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/" 2>/dev/null || echo "000")
+  if [[ "$STATUS" =~ ^[23] ]]; then
+    echo "    Web app ready (HTTP $STATUS)."
+    break
+  fi
+  [[ "$i" -eq 60 ]] && { echo "    WARNING: Web app did not respond after 5 minutes; skipping license pre-install." >&2; }
+  echo "    Waiting for web app... ($i/60, last status: $STATUS)"
+  sleep 5
+done
+
+echo "==> Pre-installing license key..."
+ssh -i "$SSH_KEY_FILE" \
+  -o StrictHostKeyChecking=no \
+  -o IdentitiesOnly=yes \
+  -o BatchMode=yes \
+  "ubuntu@${PUBLIC_IP}" \
+  "cd ~/fabricate && ${REMOTE_COMPOSE_CMD} exec -T web bin/rails runner \
+    \"AppSetting.set('license_key', ENV.fetch('FABRICATE_LICENSE_KEY'))\"" \
+  && echo "    License installed." \
+  || echo "    WARNING: License pre-install failed — you will need to enter it in the setup wizard." >&2
 
 # ---------------------------------------------------------------------------
 # Save state for tear-down
@@ -603,8 +592,15 @@ echo "  Fabricate Instance Ready"
 echo "========================================"
 echo "  Instance ID:  $INSTANCE_ID"
 echo "  Public IP:    $PUBLIC_IP"
-echo "  Fabricate:    http://${PUBLIC_IP}:3000"
+echo "  Fabricate:    https://${PUBLIC_IP}  (self-signed cert — click through browser warning)"
 echo "  Admin email:  $ADMIN_EMAIL"
+if [[ "$EMAIL_MODE" == "mailhog" ]]; then
+echo "  Mailhog UI:   http://${PUBLIC_IP}:8025  (captured outbound email)"
+elif [[ "$EMAIL_MODE" == "smtp" ]]; then
+echo "  Email:        SMTP via ${FABRICATE_MAIL_ADDRESS}:${FABRICATE_MAIL_PORT}"
+elif [[ "$EMAIL_MODE" == "ses" ]]; then
+echo "  Email:        SES (IAM role)"
+fi
 echo "========================================"
 echo ""
 echo "To SSH in:"
@@ -615,7 +611,8 @@ if [[ -z "$ANTHROPIC_API_KEY" ]]; then
   echo "  sudo docker compose -f ~/fabricate/docker-compose.yaml up -d --force-recreate"
   echo ""
 fi
-echo "Complete setup at: http://${PUBLIC_IP}:3000"
+echo "Complete setup at: https://${PUBLIC_IP}"
+echo "  (Your browser will warn about a self-signed certificate — click 'Advanced' and proceed.)"
 echo "  1. Click 'Get Started'"
 echo "  2. Run the compatibility check"
 echo "  3. Enter your license key"

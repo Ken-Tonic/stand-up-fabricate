@@ -34,7 +34,7 @@ cp .env.template .env
 | `INSTANCE_TYPE` | `t3.large` | EC2 instance type (8 GB RAM recommended minimum) |
 | `AWS_REGION` | `us-east-1` | AWS region to deploy into |
 | `ADMIN_EMAIL` | `admin@fabricate.local` | Email for the initial Fabricate admin account |
-| `DISK_SIZE_GB` | `40` | Root EBS volume size in GB |
+| `DISK_SIZE_GB` | `60` | Root EBS volume size in GB |
 | `VPC_ID` | _(prompts)_ | Pre-set to skip the interactive VPC selection |
 
 ## Usage
@@ -78,6 +78,18 @@ After the script finishes it prints the URL, e.g. `http://<public-ip>:3000`. Ope
 3. Enter your license key
 4. Configure telemetry
 5. Create your admin account (use the `ADMIN_EMAIL` you configured)
+
+### Email delivery
+
+The script supports three modes, configured via `.env`:
+
+| Mode | When | Behaviour |
+|---|---|---|
+| **Mailhog** (default) | Neither `FABRICATE_MAIL_ADDRESS` nor `FABRICATE_USE_SES` is set | A Mailhog container is added to the Docker stack. All outbound email is captured and viewable at `http://<ip>:8025`. Nothing is ever delivered. |
+| **SMTP** | `FABRICATE_MAIL_ADDRESS` is set | Fabricate sends real email via the configured SMTP server. `FABRICATE_MAIL_PORT`, `FABRICATE_MAIL_USER_NAME`, and `FABRICATE_MAIL_PASSWORD` are also required. |
+| **SES** | `FABRICATE_USE_SES=true` | Fabricate uses the EC2 instance's IAM role to send via SES. The role must have `ses:SendRawEmail` permission for the sender identity. |
+
+See `.env.template` for the full list of SMTP variables.
 
 ### Switching LLM providers after deployment
 

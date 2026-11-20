@@ -1,0 +1,121 @@
+networks:
+  fabricate_internal:
+    driver: bridge
+  fabricate_internal_pdf:
+    internal: true
+
+volumes:
+  fabricate_data:
+  fabricate_local_storage:
+  postgres_data:
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${FABRICATE_DATABASE_USERNAME}
+      POSTGRES_PASSWORD: ${FABRICATE_DATABASE_PASSWORD}
+      POSTGRES_DB: ${FABRICATE_DATABASE_NAME}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - fabricate_internal
+
+  redis:
+    image: 'redis:7.4.8'
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${FABRICATE_REDIS_PASSWORD}
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\""]
+    networks:
+      - fabricate_internal
+
+  pdf-sidecar:
+    image: 'quay.io/tonicai/fabricate-html-to-pdf-sidecar:latest'
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1024m
+    environment:
+      FABRICATE_PDF_PORT: ${FABRICATE_PDF_PORT:-3100}
+    volumes:
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: 536870912
+      - type: tmpfs
+        target: /dev/shm
+        tmpfs:
+          size: 268435456
+    networks:
+      - fabricate_internal_pdf
+
+  web:
+    image: 'quay.io/tonicai/fabricate:latest'
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_started
+      redis:
+        condition: service_started
+      pdf-sidecar:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      FABRICATE_PDF_HOST: pdf-sidecar
+      FABRICATE_PDF_PORT: ${FABRICATE_PDF_PORT:-3100}
+    cap_add:
+      - SYS_PTRACE
+    volumes:
+      - fabricate_data:/fabricate/data
+      - fabricate_local_storage:/fabricate/storage
+    networks:
+      - fabricate_internal
+      - fabricate_internal_pdf
+
+  worker:
+    image: 'quay.io/tonicai/fabricate:latest'
+    restart: unless-stopped
+    command: ["bundle", "exec", "sidekiq", "-e", "production"]
+    depends_on:
+      db:
+        condition: service_started
+      redis:
+        condition: service_started
+      pdf-sidecar:
+        condition: service_healthy
+      web:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      FABRICATE_PDF_HOST: pdf-sidecar
+      FABRICATE_PDF_PORT: ${FABRICATE_PDF_PORT:-3100}
+    cap_add:
+      - SYS_PTRACE
+    volumes:
+      - fabricate_data:/fabricate/data
+      - fabricate_local_storage:/fabricate/storage
+    networks:
+      - fabricate_internal
+      - fabricate_internal_pdf
+
+  nginx:
+    image: 'nginx:alpine'
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/fabricate.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+      - /dev/null:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - web
+    networks:
+      - fabricate_internal
