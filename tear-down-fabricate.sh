@@ -37,16 +37,20 @@ fi
 # ---------------------------------------------------------------------------
 if [[ -n "${INSTANCE_ID:-}" ]]; then
   echo "==> Terminating EC2 instance '$INSTANCE_ID'..."
-  aws ec2 terminate-instances \
-    --region "$AWS_REGION" \
-    --instance-ids "$INSTANCE_ID" \
-    > /dev/null
-
-  echo "==> Waiting for instance to terminate..."
-  aws ec2 wait instance-terminated \
-    --region "$AWS_REGION" \
-    --instance-ids "$INSTANCE_ID"
-  echo "    Instance terminated."
+  if aws ec2 terminate-instances \
+      --region "$AWS_REGION" \
+      --instance-ids "$INSTANCE_ID" \
+      > /dev/null 2>/tmp/term-err; then
+    echo "==> Waiting for instance to terminate..."
+    aws ec2 wait instance-terminated \
+      --region "$AWS_REGION" \
+      --instance-ids "$INSTANCE_ID"
+    echo "    Instance terminated."
+  elif grep -q "InvalidInstanceID.NotFound" /tmp/term-err; then
+    echo "    Instance not found — already terminated."
+  else
+    cat /tmp/term-err >&2; exit 1
+  fi
 else
   echo "WARNING: INSTANCE_ID not set, skipping instance termination."
 fi
@@ -56,10 +60,26 @@ fi
 # ---------------------------------------------------------------------------
 if [[ -n "${SG_ID:-}" ]]; then
   echo "==> Deleting security group '$SG_ID'..."
-  aws ec2 delete-security-group \
-    --region "$AWS_REGION" \
-    --group-id "$SG_ID"
-  echo "    Security group deleted."
+  # ENIs can persist briefly after instance termination; retry on DependencyViolation.
+  for i in $(seq 1 24); do
+    if aws ec2 delete-security-group \
+        --region "$AWS_REGION" \
+        --group-id "$SG_ID" 2>/tmp/sg-delete-err; then
+      echo "    Security group deleted."
+      break
+    fi
+    if grep -q "InvalidGroup.NotFound" /tmp/sg-delete-err; then
+      echo "    Security group already deleted."
+      break
+    elif grep -q "DependencyViolation" /tmp/sg-delete-err; then
+      [[ "$i" -eq 24 ]] && { cat /tmp/sg-delete-err >&2; exit 1; }
+      echo "    Waiting for network interfaces to detach... ($i/24)"
+      sleep 5
+    else
+      cat /tmp/sg-delete-err >&2
+      exit 1
+    fi
+  done
 else
   echo "WARNING: SG_ID not set, skipping security group deletion."
 fi
@@ -69,10 +89,15 @@ fi
 # ---------------------------------------------------------------------------
 if [[ -n "${KEY_NAME:-}" ]]; then
   echo "==> Deleting key pair '$KEY_NAME'..."
-  aws ec2 delete-key-pair \
-    --region "$AWS_REGION" \
-    --key-name "$KEY_NAME"
-  echo "    Key pair deleted."
+  if aws ec2 delete-key-pair \
+      --region "$AWS_REGION" \
+      --key-name "$KEY_NAME" 2>/tmp/kp-delete-err; then
+    echo "    Key pair deleted."
+  elif grep -q "InvalidKeyPair.NotFound" /tmp/kp-delete-err; then
+    echo "    Key pair already deleted."
+  else
+    cat /tmp/kp-delete-err >&2; exit 1
+  fi
 
   if [[ -f "${SSH_KEY_FILE:-}" ]]; then
     rm -f "$SSH_KEY_FILE"
